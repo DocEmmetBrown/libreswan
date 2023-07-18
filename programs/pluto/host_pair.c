@@ -305,24 +305,14 @@ void release_dead_interfaces(struct logger *logger)
 		 * template will only be processed after all instances
 		 * have been deleted.
 		 */
+		remove_connection_from_pending(c);
+		delete_states_by_connection(c);
+		connection_unroute(c, HERE);
 		if (is_instance(c)) {
 			delete_connection(&c);
 			pexpect(c == NULL);
 			continue;
 		}
-
-		/*
-		 * The somewhat permanent connection is going away;
-		 * release it ...
-		 *
-		 * XXX: this code was passing relations=true to
-		 * release_connection() - i.e., delete any Child SAs
-		 * sharing this connection's IKE SA.  However, since
-		 * those's Child SAs sharing the IKE SA are also
-		 * sharing the IKE SA's interface and that is going
-		 * away, the'll be deleted anyway.
-		 */
-		release_connection(c);
 
 		/*
 		 * ... and then disorient it, moving it to the

@@ -386,39 +386,6 @@ static void routed_negotiation_to_unrouted(enum routing_event event,
 	set_routing(event, c, RT_UNROUTED, NULL, where);
 }
 
-static void terminate_routed_tunnel_permanent(enum routing_event event,
-					      struct connection **c,
-					      struct logger *logger, where_t where,
-					      const char *story)
-{
-	del_policy(*c, POLICY_UP);
-	struct ike_sa *ike = ike_sa_by_serialno((*c)->newest_ike_sa);
-	if (ike != NULL) {
-		if (zap_connection_states(event, c, &ike, where)) {
-			return;
-		}
-	}
-
-	struct child_sa *child = child_sa_by_serialno((*c)->newest_ipsec_sa);
-	if (PBAD(logger, child == NULL)) {
-		return;
-	}
-
-	state_attach(&child->sa, logger);
-	PEXPECT(logger, child->sa.st_connection == *c);
-	do_updown_spds(UPDOWN_DOWN, *c, &(*c)->child.spds, &child->sa, logger);
-	delete_spd_kernel_policies(&(*c)->child.spds,
-				   EXPECT_KERNEL_POLICY_OK,
-				   logger, where, story);
-	/*
-	 * update routing; route_owner() will see this and not think
-	 * this route is the owner?
-	 */
-	set_routing(event, *c, RT_UNROUTED, NULL, where);
-	do_updown_unroute(*c, child);
-	delete_child_sa(&child);
-}
-
 /*
  * Either C is permanent, or C is an instance that going to be revived
  * - the full set of SPDs need to be changed to negotiation (just
@@ -527,7 +494,6 @@ void connection_revive(struct connection *c, const threadtime_t *inception, wher
 	if (c->config->ike_version == IKEv1 && is_labeled(c)) {
 		initiate_connection(c, /*remote-host-name*/NULL,
 				    /*background*/true,
-				    /*log-failure*/true,
 				    c->logger);
 		return;
 	}
@@ -652,6 +618,11 @@ static void down_routed_tunnel(enum routing_event event,
 
 	ldbg_routing((*child)->sa.st_logger, "keeping connection; NO!");
 	delete_child_sa(child);
+
+	remove_connection_from_pending(*c);
+	delete_states_by_connection(*c);
+	connection_unroute(*c, HERE);
+
 	delete_connection(c);
 }
 
@@ -814,6 +785,11 @@ static bool zap_connection_states(enum routing_event event,
 		 */
 		if (is_instance(*c) &&
 		    (*c)->child.routing == RT_UNROUTED) {
+
+			remove_connection_from_pending(*c);
+			delete_states_by_connection(*c);
+			connection_unroute(*c, HERE);
+
 			delete_connection(c);
 		}
 		return true;
@@ -876,6 +852,11 @@ static bool unroute_connection_instances(enum routing_event event, struct connec
 				 0,
 			 });
 		/* unroute doesn't delete instances, should it? */
+
+		remove_connection_from_pending(cq.c);
+		delete_states_by_connection(cq.c);
+		connection_unroute(cq.c, HERE);
+
 		delete_connection(&cq.c);
 	}
 	return had_instances;
@@ -889,11 +870,6 @@ void connection_route(struct connection *c, where_t where)
 		return;
 	}
 
-	if (is_group(c)) {
-		connection_group_route(c, where);
-		return;
-	}
-
 	dispatch(CONNECTION_ROUTE, &c, c->logger, where,
 		 (struct annex) {
 			 0,
@@ -903,14 +879,11 @@ void connection_route(struct connection *c, where_t where)
 
 void connection_unroute(struct connection *c, where_t where)
 {
-	if (is_group(c)) {
-		/* XXX: may recurse back to here with group
-		 * instances. */
-		connection_group_unroute(c, where);
-		return;
-	}
-
-	del_policy(c, POLICY_ROUTE);
+	/*
+	 * XXX: strip POLICY_ROUTE in whack code, not here (code
+	 * expects to be able to route/unroute without loosing the
+	 * policy bits).
+	 */
 	dispatch(CONNECTION_UNROUTE, &c,
 		 c->logger, where,
 		 (struct annex) {
@@ -950,6 +923,11 @@ void connection_delete_child(struct ike_sa *ike, struct child_sa **child, where_
 		state_attach(&(*child)->sa, ike->sa.st_logger);
 		delete_child_sa(child);
 		if (is_labeled_child(c)) {
+
+			remove_connection_from_pending(c);
+			delete_states_by_connection(c);
+			connection_unroute(c, HERE);
+
 			delete_connection(&c);
 		}
 	}
@@ -1077,6 +1055,14 @@ void dispatch(enum routing_event event,
 		const enum connection_kind kind = (*c)->local->kind;
 
 		switch (XX(event, routing, kind)) {
+
+		case X(ROUTE, UNROUTED, GROUP):
+			/* caller deals with recursion */
+			add_policy(*c, POLICY_ROUTE); /* always */
+			return;
+		case X(UNROUTE, UNROUTED, GROUP):
+			/* ROUTE+UP cleared by caller */
+			return;
 
 		case X(ROUTE, UNROUTED, TEMPLATE):
 		case X(ROUTE, UNROUTED, LABELED_TEMPLATE):
@@ -1233,7 +1219,6 @@ void dispatch(enum routing_event event,
 				*/
 				initiate_connection(*c, /*remote-host-name*/NULL,
 						    /*background*/true,
-						    /*log-failure*/true,
 						    logger);
 				return;
 			}
@@ -1639,6 +1624,11 @@ void dispatch(enum routing_event event,
 				set_routing(event, *c, RT_UNROUTED, NULL, where);
 			}
 			delete_ike_sa(e->ike);
+
+			remove_connection_from_pending(*c);
+			delete_states_by_connection(*c);
+			connection_unroute(*c, HERE);
+
 			delete_connection(c);
 			return;
 
@@ -1728,6 +1718,11 @@ void dispatch(enum routing_event event,
 			if (is_instance(*c) &&
 			    e->ike != NULL/*IKEv1?*/ &&
 			    *c != (*e->ike)->sa.st_connection) {
+
+				remove_connection_from_pending(*c);
+				delete_states_by_connection(*c);
+				connection_unroute(*c, HERE);
+
 				delete_connection(c);
 			}
 			return;
@@ -1862,11 +1857,6 @@ void dispatch(enum routing_event event,
 				do_updown(UPDOWN_UP, *c, spd, &(*e->child)->sa, logger);
 				do_updown(UPDOWN_ROUTE, *c, spd, &(*e->child)->sa, logger);
 			}
-			return;
-
-		case X(TERMINATE, ROUTED_TUNNEL, PERMANENT):
-			terminate_routed_tunnel_permanent(event, c, logger, where,
-							  "terminate permanent");
 			return;
 
 		}

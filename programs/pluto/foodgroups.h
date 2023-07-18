@@ -18,13 +18,8 @@
 struct connection;      /* forward declaration */
 struct logger;
 
-extern void delete_connection_group_instances(const struct connection *c);
+void load_groups(struct logger *logger);
 
-extern void connection_group_route(struct connection *c, where_t where);
-extern void connection_group_unroute(struct connection *c, where_t where);
-
-extern void load_groups(struct logger *logger);
-
-void free_foodgroups(void);
+void remove_from_group(struct connection *c);
 
 #endif

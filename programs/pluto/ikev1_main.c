@@ -2207,7 +2207,15 @@ bool accept_delete(struct msg_digest *md,
 						 * states tied to the
 						 * connection?
 						 */
-						delete_states_by_connection(&rc);
+						delete_states_by_connection(rc);
+						if (is_instance(rc)) {
+
+							remove_connection_from_pending(rc);
+							delete_states_by_connection(rc);
+							connection_unroute(rc, HERE);
+
+							delete_connection(&rc);
+						}
 						md->v1_st = NULL;
 					}
 				}

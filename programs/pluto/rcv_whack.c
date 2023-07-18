@@ -10,7 +10,7 @@
  * Copyright (C) 2012-2013 Paul Wouters <paul@libreswan.org>
  * Copyright (C) 2014-2020 Paul Wouters <pwouters@redhat.com>
  * Copyright (C) 2014-2017 Antony Antony <antony@phenome.org>
- * Copyright (C) 2019 Andrew Cagney <cagney@gnu.org>
+ * Copyright (C) 2019-2023 Andrew Cagney <cagney@gnu.org>
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -23,86 +23,48 @@
  * for more details.
  */
 
-#include <stdio.h>
-#include <stddef.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <resolv.h>
-#include <fcntl.h>
-#include <unistd.h>		/* for gethostname() */
+#include <unistd.h>			/* for getsid() */
 
-#include <event2/event.h>
-#include <event2/event_struct.h>
-
-#include "lswconf.h"
-#include "constants.h"
-#include "defs.h"
-#include "id.h"
-#include "x509.h"
-#include "pluto_x509.h"
-#include "certs.h"
-#include "connections.h"        /* needs id.h */
-#include "foodgroups.h"		/* for load_groups() */
-#include "whack.h"
-#include "packet.h"
-#include "demux.h"              /* needs packet.h */
-#include "state.h"
-#include "ipsec_doi.h"          /* needs demux.h and state.h */
-#include "kernel.h"             /* needs connections.h */
-#include "routing.h"
+#include "connections.h"
 #include "rcv_whack.h"
 #include "log.h"
 #include "lswfips.h"
-#include "keys.h"
-#include "secrets.h"
-#include "server.h"
-#include "fetch.h"
-#include "timer.h"
-#include "ikev2.h"
-#include "ikev2_redirect.h"
-#include "ikev2_delete.h"
-#include "ikev2_liveness.h"
-#include "server.h" /* for pluto_seccomp */
-#include "kernel_alg.h"
-#include "ike_alg.h"
-#include "ip_address.h" /* for setportof() */
-#include "crl_queue.h"
-#include "pluto_sd.h"
-#include "initiate.h"
-#include "terminate.h"
-#include "acquire.h"
-#include "iface.h"
 #include "show.h"
-#include "impair_message.h"
+#include "kernel.h"
 #ifdef USE_SECCOMP
 #include "pluto_seccomp.h"
 #endif
-#include "server_fork.h"		/* for show_process_status() */
+
+#include "initiate.h"			/* for initiate_connection() */
+#include "acquire.h"			/* for initiate_ondemand() */
+#include "keys.h"			/* for load_preshared_secrets() */
+#include "crl_queue.h"			/* for submit_crl_fetch_requests() */
+#include "nss_cert_reread.h"		/* for reread_cert_connections() */
 #include "root_certs.h"			/* for free_root_certs() */
-
+#include "server.h"			/* for call_global_event_inline() */
+#include "ikev2_liveness.h"		/* for submit_v2_liveness_exchange() */
+#include "send.h"			/* for send_keepalive_using_state() */
+#include "impair_message.h"		/* for add_message_impairment() */
+#include "pluto_sd.h"			/* for pluto_sd() */
 #ifdef USE_XFRM_INTERFACE
-# include "kernel_xfrm_interface.h"
+#include "kernel_xfrm_interface.h"	/* for stale_xfrmi_interfaces() */
 #endif
-#include "addresspool.h"
-
-#include "pluto_stats.h"
-
-#include "nss_cert_reread.h"
-#include "send.h"			/* for impair: send_keepalive() */
+#include "iface.h"			/* for find_ifaces() */
+#include "foodgroups.h"			/* for load_groups() */
+#include "ikev2_delete.h"		/* for submit_v2_delete_exchange() */
+#include "ikev2_redirect.h"		/* for find_and_active_redirect_states() */
+#include "addresspool.h"		/* for show_addresspool_status() */
+#include "pluto_stats.h"		/* for clear_pluto_stats() et.al. */
+#include "server_fork.h"		/* for show_process_status() */
 #include "pluto_shutdown.h"		/* for shutdown_pluto() */
-#include "orient.h"
-#include "ikev2_create_child_sa.h"	/* for submit_v2_CREATE_CHILD_SA_*() */
 
-#include "whack_trafficstatus.h"
+#include "whack_connection.h"
 #include "whack_rekey.h"
 #include "whack_delete.h"
 #include "whack_status.h"
+#include "whack_trafficstatus.h"
+#include "whack_terminate.h"
+#include "whack_route.h"
 
 static void whack_rereadsecrets(struct show *s)
 {
@@ -127,171 +89,15 @@ static void whack_listcacerts(struct show *s)
 	root_certs_delref(&roots, show_logger(s));
 }
 
-/*
- * When there's no name, whack all connections.
- *
- * How to decorate this with a header / footer?
- */
-
-void whack_all_connections(const struct whack_message *m, struct show *s,
-			   bool (*whack_connection)
-			   (struct show *s,
-			    struct connection **c,
-			    const struct whack_message *m))
-{
-	struct connection **connections = sort_connections();
-	if (connections == NULL) {
-		return;
-	}
-
-	for (struct connection **cp = connections; *cp != NULL; cp++) {
-		whack_connection(s, cp, m);
-	}
-	pfree(connections);
-}
-
-void whack_each_connection(const struct whack_message *m, struct show *s,
-			   bool (*whack_connection)
-			   (struct show *s,
-			    struct connection **c,
-			    const struct whack_message *m),
-			   struct each each)
-{
-	struct logger *logger = show_logger(s);
-	unsigned nr_found = 0;
-
-	/*
-	 * First try by name.
-	 */
-	struct connection_filter by_name = {
-		.name = m->name,
-		.where = HERE,
-	};
-	while (next_connection_new2old(&by_name)) {
-		/*
-		 * XXX: broken, other whack_connection() calls do not have this guard.
-		 *
-		 * Instead instead let whack_connection() decide if
-		 * the connection should be skipped and return true
-		 * when the connection should be counted?
-		 */
-		if (each.skip_instances && is_instance(by_name.c)) {
-			continue;
-		}
-		whack_connection(s, &by_name.c, m);
-		nr_found++;
-	}
-	if (nr_found > 0) {
-		return;
-	}
-
-	/*
-	 * When name fails, try by alias.
-	 */
-	struct connection_filter by_alias = {
-		.alias = m->name,
-		.where = HERE,
-	};
-	while (next_connection_new2old(&by_alias)) {
-		if (nr_found == 0 && each.future_tense != NULL) {
-			llog(RC_COMMENT, logger, "%s all connections with alias=\"%s\"",
-			     each.future_tense, m->name);
-		}
-		whack_connection(s, &by_alias.c, m);
-		nr_found++;
-	}
-	if (nr_found == 1) {
-		if (each.past_tense != NULL) {
-			llog(RC_COMMENT, logger, "%s %u connection",
-			     each.past_tense, nr_found);
-		}
-		return;
-	}
-	if (nr_found > 1) {
-		if (each.past_tense != NULL) {
-			llog(RC_COMMENT, logger, "%s %u connections",
-			     each.past_tense, nr_found);
-		}
-		return;
-	}
-
-	/*
-	 * When alias fails, see if the name is a connection ($
-	 * prefix) and/or state (# prefix) number.
-	 */
-
-	if (m->name[0] == '$' ||
-	    m->name[0] == '#') {
-		ldbg(logger, "looking up '%s' by serialno", m->name);
-		uintmax_t serialno = 0;
-		err_t e = shunk_to_uintmax(shunk1(m->name + 1), NULL, /*base*/0, &serialno);
-		if (e != NULL) {
-			llog(RC_LOG, logger, "invalid serial number '%s': %s",
-			     m->name, e);
-			return;
-		}
-		if (serialno >= INT_MAX) {/* arbitrary limit */
-			llog(RC_LOG, logger, "serial number '%s' is huge", m->name);
-			return;
-		}
-		switch (m->name[0]) {
-		case '$':
-		{
-			struct connection *c = connection_by_serialno(serialno);
-			if (c != NULL) {
-				whack_connection(s, &c, m);
-				return;
-			}
-			break;
-		}
-		case '#':
-		{
-			struct state *st = state_by_serialno(serialno);
-			if (st != NULL) {
-				struct connection *c = st->st_connection;
-				whack_connection(s, &c, m);
-				return;
-			}
-			break;
-		}
-		}
-		llog(RC_LOG, logger, "serialno '%s' not found", m->name);
-		return;
-	}
-
-	/*
-	 * Danger:
-	 *
-	 * Logging with RC_UNKNOWN_NAME is "fatal" - when whack sees
-	 * it it, it detaches immediately.  For instance, adding a
-	 * connection is performed in two steps: DELETE+ADD; KEYS.
-	 * When there's no connection to delete that should not be
-	 * logged as it A. is confusing and B. would cause whack to
-	 * detach stopping the KEYS from being added.
-	 */
-	if (each.log_unknown_name) {
-#define MESSAGE "no connection or alias named \"%s\"'", m->name
-		/* what means leave more breadcrumbs */
-		if (each.past_tense != NULL) {
-			llog(RC_UNKNOWN_NAME, logger, MESSAGE);
-		} else {
-			whack_log(RC_UNKNOWN_NAME, s, MESSAGE);
-		}
-	}
-#undef MESSAGE
-}
-
 static bool whack_initiate_connection(struct show *s, struct connection **c,
 				      const struct whack_message *m)
 {
 	struct logger *logger = show_logger(s);
 	connection_buf cb;
 	dbg("%s() for "PRI_CONNECTION, __func__, pri_connection(*c, &cb));
-	bool log_failure = ((*c)->config->connalias == NULL);
 	return initiate_connection(*c,
 				   m->remote_host,
 				   m->whack_async/*background*/,
-				   log_failure,
 				   logger);
 }
 
@@ -393,34 +199,19 @@ static bool whack_connection_status(struct show *s, struct connection **c,
 	return true;
 }
 
-static bool whack_route_connection(struct show *s, struct connection **c,
-				   const struct whack_message *m UNUSED)
-{
-	connection_attach(*c, show_logger(s));
-	connection_route(*c, HERE);
-	connection_detach(*c, show_logger(s));
-	return true; /* ok; keep going */
-}
-
 static bool whack_unroute_connection(struct show *s, struct connection **c,
 				     const struct whack_message *m UNUSED)
 {
 	connection_attach(*c, show_logger(s));
+	/*
+	 * Let code know of intent.
+	 *
+	 * Functions such as connection_unroute() don't fiddle policy
+	 * bits as they are called as part of unroute/route sequences.
+	 */
+	del_policy(*c, POLICY_ROUTE);
 	connection_unroute(*c, HERE);
 	connection_detach(*c, show_logger(s));
-	return true; /* ok; keep going */
-}
-
-static bool whack_terminate_connections(struct show *s, struct connection **c,
-					const struct whack_message *m UNUSED)
-{
-#if 0
-	connection_attach(*c, show_logger(s));
-#endif
-	terminate_connections(c, show_logger(s), HERE);
-#if 0
-	connection_detach(*c, show_logger(s));
-#endif
 	return true; /* ok; keep going */
 }
 
@@ -998,21 +789,7 @@ static void whack_process(const struct whack_message *const m, struct show *s)
 
 	if (m->whack_route) {
 		dbg_whack(s, "route: start: \"%s\"", (m->name == NULL ? "<null>" : m->name));
-		if (!listening) {
-			whack_log(RC_DEAF, s,
-				  "need --listen before --route");
-		} else if (m->name == NULL) {
-			/* leave bread crumb */
-			llog(RC_FATAL, logger,
-			     "received command to route connection, but did not receive the connection name - ignored");
-		} else {
-			whack_each_connection(m, s, whack_route_connection,
-					      (struct each) {
-						      .log_unknown_name = true,
-						      .skip_instances = true,
-					      });
-
-		}
+		whack_route(m, s);
 		dbg_whack(s, "route: stop: \"%s\"", (m->name == NULL ? "<null>" : m->name));
 	}
 
@@ -1089,19 +866,7 @@ static void whack_process(const struct whack_message *const m, struct show *s)
 
 	if (m->whack_terminate) {
 		dbg_whack(s, "terminate: start: %s", (m->name == NULL ? "<null>" : m->name));
-		if (m->name == NULL) {
-			/* leave bread crumb */
-			llog(RC_FATAL, logger,
-			     "received command to terminate connection, but did not receive the connection name - ignored");
-		} else {
-			whack_each_connection(m, s, whack_terminate_connections,
-					      (struct each) {
-						      .future_tense = "terminating",
-						      .past_tense = "terminated",
-						      .log_unknown_name = true,
-						      .skip_instances = true,
-					      });
-		}
+		whack_terminate(m, s);
 		dbg_whack(s, "terminate: stop: %s", (m->name == NULL ? "<null>" : m->name));
 	}
 

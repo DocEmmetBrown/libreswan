@@ -102,6 +102,8 @@
 #include "timescale.h"
 #include "connection_event.h"
 
+static void discard_connection(struct connection **cp, bool connection_valid);
+
 void ldbg_connection(const struct connection *c, where_t where,
 		     const char *message, ...)
 {
@@ -183,14 +185,6 @@ bool connection_with_name_exists(const char *name)
 	return false;
 }
 
-void release_connection(struct connection *c)
-{
-	remove_connection_from_pending(c);
-	delete_states_by_connection(&c);
-	passert(c != NULL);
-	connection_unroute(c, HERE);
-}
-
 /* Delete a connection */
 static void discard_spd_end_content(struct spd_end *e)
 {
@@ -225,48 +219,20 @@ void discard_connection_spds(struct connection *c)
  *
  */
 
-static void discard_connection(struct connection **cp, bool connection_valid);
-
 void delete_connection(struct connection **cp)
 {
-	struct connection *c = *cp;
-	*cp = NULL;
-
-	if (is_group(c)) {
-		delete_connection_group_instances(c);
-		/* continue with deleting this connection */
-	}
-
-	/*
-	 * See if a connection, any connection (presumably an
-	 * instance), is still using this connection.
-	 */
-
-	/*
-	 * Must be careful to avoid circularity, something like:
-	 *
-	 *   release_connection() ->
-	 *   delete_states_by_connection() ->
-	 *   delete_v1_states_by_connection() ->
-	 *   delete_connection().
-	 *
-	 * We mark c as going away so it won't get deleted
-	 * recursively.
-	 */
-	PASSERT(c->logger, !c->going_away);
-
-	if (is_instance(c)) {
-		c->going_away = true;
-		if (!is_opportunistic(c)) {
+	if (is_instance(*cp)) {
+		/* XXX: pointless check? */
+		if (!is_opportunistic(*cp)) {
+			/* XXX: pointless log? */
 			address_buf b;
-			llog(RC_LOG, c->logger,
-			     "deleting connection instance with peer %s {isakmp=#%lu/ipsec=#%lu}",
-			     str_address_sensitive(&c->remote->host.addr, &b),
-			     c->newest_ike_sa, c->newest_ipsec_sa);
+			llog(RC_LOG, (*cp)->logger,
+			     "deleting connection instance with peer %s",
+			     str_address_sensitive(&(*cp)->remote->host.addr, &b));
 		}
 	}
-	release_connection(c);
-	discard_connection(&c, true/*connection_valid*/);
+
+	discard_connection(cp, true/*connection_valid*/);
 }
 
 static void discard_connection(struct connection **cp, bool connection_valid)
@@ -279,39 +245,77 @@ static void discard_connection(struct connection **cp, bool connection_valid)
 	     pri_connection_co(c),
 	     pri_connection_co(c->clonedfrom));
 
-	/*.
-	 * Don't expect any states to still be using this connection.
-	 * When there are things quickly explode so help it along.
+	/*
+	 * Must be unrouted (i.e., all policies have been pulled).
 	 */
-	{
-		struct state_filter sf = {
-			.connection_serialno = c->serialno,
-			.where = HERE,
-		};
-		if (next_state_new2old(&sf)) {
-			state_buf sb;
-			llog_passert(c->logger, HERE,
-				     "unexpected state "PRI_STATE" when deleting connection",
-				     pri_state(sf.st, &sb));
-		}
+	if (c->child.routing != RT_UNROUTED) {
+		enum_buf rn;
+		llog_passert(c->logger, HERE,
+			     "connection still %s",
+			     str_enum_short(&routing_names, c->child.routing, &rn));
 	}
 
 	/*
-	 * Don't expect any instances.  When there are things quickly
-	 * explode so help it along.
+	 * Must not be pending (i.e., not on a queue waiting for an
+	 * IKE SA to establish).
 	 */
-	{
-		struct connection_filter cf = {
-			.clonedfrom = c,
-			.where = HERE,
-		};
-		if (next_connection_old2new(&cf)) {
-			connection_buf cb;
-			llog_passert(c->logger, HERE,
-				     "unexpected instance "PRI_CONNECTION" when deleting connection",
-				     pri_connection(cf.c, &cb));
-		}
+	PASSERT(c->logger, !connection_is_pending(c));
+
+	/*
+	 * Must have newest all cleared.
+	 */
+	if (c->newest_ike_sa != SOS_NOBODY) {
+		llog_passert(c->logger, HERE,
+			     "connection still has %s "PRI_SO,
+			     c->config->ike_info->ike_sa_name,
+			     pri_so(c->newest_ike_sa));
 	}
+	if (c->newest_ipsec_sa != SOS_NOBODY) {
+		llog_passert(c->logger, HERE,
+			     "connection still has %s "PRI_SO,
+			     c->config->ike_info->child_sa_name,
+			     pri_so(c->newest_ipsec_sa));
+	}
+	if (c->child.newest_routing_sa != SOS_NOBODY) {
+		llog_passert(c->logger, HERE,
+			     "connection still has routing SA "PRI_SO,
+			     pri_so(c->child.newest_routing_sa));
+	}
+
+	/*
+	 * Must not have instances (i.e., all intantiations are gone).
+	 */
+	struct connection_filter instance = {
+		.clonedfrom = c,
+		.where = HERE,
+	};
+	if (next_connection_old2new(&instance)) {
+		connection_buf cb;
+		llog_passert(c->logger, HERE,
+			     "connection still instantiated as "PRI_CONNECTION,
+			     pri_connection(instance.c, &cb));
+	}
+
+	/*.
+	 * Must not have states (i.e., no states are refering to this
+	 * connection).
+	 */
+	struct state_filter state = {
+		.connection_serialno = c->serialno,
+		.where = HERE,
+	};
+	if (next_state_new2old(&state)) {
+		state_buf sb;
+		llog_passert(c->logger, HERE,
+			     "connection is still being used by %s "PRI_STATE,
+			     sa_name(state.st->st_connection->config->ike_version,
+				     state.st->st_sa_type_when_established),
+			     pri_state(state.st, &sb));
+	}
+
+	/*
+	 * Finall start cleanup.
+	 */
 
 	FOR_EACH_ELEMENT(afi, ip_families) {
 		if (c->pool[afi->ip_index] != NULL) {
@@ -337,6 +341,8 @@ static void discard_connection(struct connection **cp, bool connection_valid)
 		free_id_content(&end->host.id);
 		pfreeany(end->child.selectors.accepted.list);
 	}
+
+	remove_from_group(c);
 
 	/*
 	 * Logging no longer valid.  Can this be delayed further?
@@ -411,6 +417,11 @@ void delete_every_connection(void)
 			break;
 		}
 		struct connection *c = cq.c;
+
+		remove_connection_from_pending(c);
+		delete_states_by_connection(c);
+		connection_unroute(c, HERE);
+
 		delete_connection(&c);
 	}
 }
@@ -3765,6 +3776,11 @@ void connection_delete_unused_instance(struct connection **cp,
 	dbg("connection "PRI_CONNECTION" is not being used, deleting",
 	    pri_connection(c, &cb));
 	attach_fd(c->logger, whackfd);
+
+	remove_connection_from_pending(c);
+	delete_states_by_connection(c);
+	connection_unroute(c, HERE);
+
 	delete_connection(&c);
 }
 

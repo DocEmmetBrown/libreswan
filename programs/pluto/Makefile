@@ -92,9 +92,12 @@ OBJS += retransmit.o
 
 OBJS += rcv_whack.o
 OBJS += whack_trafficstatus.o
+OBJS += whack_connection.o
 OBJS += whack_rekey.o
 OBJS += whack_delete.o
+OBJS += whack_route.o
 OBJS += whack_status.o
+OBJS += whack_terminate.o
 
 # local (possibly more up to date) copy of <linux/xfrm.h>
 ifeq ($(USE_XFRM_HEADER_COPY),true)

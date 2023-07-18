@@ -320,7 +320,8 @@ class TestResult:
         sanitize = []
         for guest_name in test.guest_names:
             sanitize.append((guest_name, guest_name + "."))
-        sanitize.append(("", ""))
+        if os.path.exists(os.path.join(test.directory, "console.txt")):
+            sanitize.append(("", ""))
 
         # Check the raw console output for problems and that it
         # matches expected output.
@@ -670,11 +671,11 @@ def mortem(test, args, logger, baseline=None, output_directory=None, quick=False
                     test_result.issues.add(Issues.BASELINE_PASSED, guest_name)
             continue
 
-        if not guest_name in baseline_result.sanitized_output:
+        if guest_name not in baseline_result.sanitized_output:
             test_result.issues.add(Issues.BASELINE_MISSING, guest_name)
             continue
 
-        if not guest_name in test_result.diff_output:
+        if guest_name not in test_result.diff_output:
             if guest_name in baseline_result.diff_output:
                 test_result.issues.add(Issues.BASELINE_FAILED, guest_name)
             continue

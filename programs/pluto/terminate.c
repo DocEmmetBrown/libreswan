@@ -59,88 +59,42 @@
 #include "terminate.h"
 #include "host_pair.h"
 
-/*
- * Is a connection in use by some state?
- */
-
-static bool shared_phase1_connection(const struct connection *c)
+static void terminate_connection(struct connection *c)
 {
-	so_serial_t serial_us = c->newest_ike_sa;
+	llog(RC_LOG, c->logger, "terminating SAs using this connection");
 
-	if (serial_us == SOS_NOBODY)
-		return false;
+	del_policy(c, POLICY_UP);
 
-	struct state_filter sf = { .where = HERE, };
-	while (next_state_new2old(&sf)) {
-		struct state *st = sf.st;
-		if (st->st_connection != c && st->st_clonedfrom == serial_us)
-			return true;
-	}
-
-	return false;
-}
-
-static void terminate_connection(struct connection **c, struct logger *logger)
-{
-	connection_attach(*c, logger);
-
-	llog(RC_LOG, (*c)->logger, "terminating SAs using this connection");
-	del_policy(*c, POLICY_UP);
-	remove_connection_from_pending(*c);
-
-	switch ((*c)->config->ike_version) {
-	case IKEv1:
-		if (shared_phase1_connection(*c)) {
-			llog(RC_LOG, (*c)->logger,
-			     "IKE SA is shared - only terminating IPsec SA");
-			if ((*c)->newest_ipsec_sa != SOS_NOBODY) {
-				struct state *st = state_by_serialno((*c)->newest_ipsec_sa);
-				state_attach(st, logger);
-				delete_state(st);
-			}
-		} else {
-			/*
-			 * CK_INSTANCE is deleted simultaneous to deleting
-			 * state :-/
-			 */
-			dbg("connection not shared - terminating IKE and IPsec SA");
-			delete_states_by_connection(c);
-		}
-		break;
-	case IKEv2:
-		if (shared_phase1_connection(*c)) {
-			llog(RC_LOG, (*c)->logger,
-			     "IKE SA is shared - only terminating IPsec SA");
-			struct child_sa *child = child_sa_by_serialno((*c)->newest_ipsec_sa);
-			if (child != NULL) {
-				state_attach(&child->sa, logger);
-				connection_delete_child(ike_sa(&child->sa, HERE),
-							&child, HERE);
-			}
-		} else {
-			/*
-			 * CK_INSTANCE is deleted simultaneous to deleting
-			 * state :-/
-			 */
-			dbg("connection not shared - terminating IKE and IPsec SA");
-			delete_states_by_connection(c);
-		}
-		break;
-	}
-
-	connection_detach(*c, logger);
+	/*
+	 * XXX: see ikev2-removed-iface-01
+	 *
+	 * Extra output appears because of the unroute:
+	 *
+	 * +002 "test2": connection no longer oriented - system interface change?
+	 * +002 "test2": unroute-host output: Device "NULL" does not exist.
+	 */
+	remove_connection_from_pending(c);
+	delete_states_by_connection(c);
+	connection_unroute(c, HERE);
 }
 
 void terminate_connections(struct connection **c, struct logger *logger, where_t where)
 {
-
 	switch ((*c)->local->kind) {
-	case CK_PERMANENT:
 	case CK_INSTANCE:
-	case CK_LABELED_PARENT:
 	case CK_LABELED_CHILD: /* should not happen? */
-		terminate_connection(c, logger); /* could delete C! */
+		connection_attach(*c, logger);
+		terminate_connection(*c);
+		delete_connection(c);
 		return;
+
+	case CK_PERMANENT:
+	case CK_LABELED_PARENT:
+		connection_attach(*c, logger);
+		terminate_connection(*c);
+		connection_detach(*c, logger);
+		return;
+
 	case CK_TEMPLATE:
 	case CK_GROUP:
 	case CK_LABELED_TEMPLATE:
